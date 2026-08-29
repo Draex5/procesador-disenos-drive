@@ -167,34 +167,31 @@ def apply_watermark(canvas, inner_rect):
         alpha=False
     ).convert("RGBA")
 
-    left, top, right, bottom = inner_rect
+    canvas_width, canvas_height = canvas.size
 
-    inner_width = right - left
-    inner_height = bottom - top
-
-    # Ajustar toda la hoja de marca de agua al área del diseño
+    # Ajustar la hoja completa de marca de agua
+    # a todo el recuadro blanco
     watermark = watermark.resize(
-        (inner_width, inner_height),
+        (canvas_width, canvas_height),
         Image.Resampling.LANCZOS
     )
 
-    # Convertir el blanco en transparencia
     pixels = watermark.load()
 
     for y in range(watermark.height):
         for x in range(watermark.width):
             r, g, b, a = pixels[x, y]
 
-            # Todo lo casi blanco desaparece
+            # Eliminar el fondo blanco
             if r > 245 and g > 245 and b > 245:
                 pixels[x, y] = (255, 255, 255, 0)
             else:
-                # Mayor visibilidad de la marca
-                pixels[x, y] = (r, g, b, 150)
+                # Intensidad de la marca
+                pixels[x, y] = (r, g, b, 100)
 
     canvas.alpha_composite(
         watermark,
-        (left, top)
+        (0, 0)
     )
 
 
