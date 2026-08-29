@@ -1,12 +1,17 @@
 import io
+
 import fitz
+import httpx
+
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
+from pydantic import BaseModel
+
 
 app = FastAPI(
     title="Procesador de Diseños",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 TEMPLATE_PATH = "plantilla.pdf"
@@ -14,9 +19,13 @@ WATERMARK_PATH = "marca_agua.pdf"
 
 RENDER_SCALE = 2.0
 
-# Ajustaremos estos dos valores después de la primera prueba
+# Ajustaremos estos valores después de la prueba final
 WATERMARK_WIDTH_RATIO = 0.65
 WATERMARK_OPACITY = 90
+
+
+class ProcessRequest(BaseModel):
+    file_url: str
 
 
 @app.get("/")
@@ -34,7 +43,10 @@ def health():
 
 def render_pdf_page(pdf_bytes=None, pdf_path=None, alpha=False):
     if pdf_bytes is not None:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        doc = fitz.open(
+            stream=pdf_bytes,
+            filetype="pdf"
+        )
     else:
         doc = fitz.open(pdf_path)
 
@@ -44,8 +56,15 @@ def render_pdf_page(pdf_bytes=None, pdf_path=None, alpha=False):
 
     page = doc[0]
 
-    matrix = fitz.Matrix(RENDER_SCALE, RENDER_SCALE)
-    pix = page.get_pixmap(matrix=matrix, alpha=alpha)
+    matrix = fitz.Matrix(
+        RENDER_SCALE,
+        RENDER_SCALE
+    )
+
+    pix = page.get_pixmap(
+        matrix=matrix,
+        alpha=alpha
+    )
 
     mode = "RGBA" if alpha else "RGB"
 
@@ -115,8 +134,13 @@ def detect_inner_rectangle(template):
             for group in groups
         ]
 
-    xs = group_positions(vertical_candidates)
-    ys = group_positions(horizontal_candidates)
+    xs = group_positions(
+        vertical_candidates
+    )
+
+    ys = group_positions(
+        horizontal_candidates
+    )
 
     if len(xs) < 4 or len(ys) < 4:
         raise ValueError(
@@ -127,9 +151,7 @@ def detect_inner_rectangle(template):
     xs = sorted(xs)
     ys = sorted(ys)
 
-    # Cuadro interior:
-    # segunda línea vertical hasta penúltima
-    # segunda línea horizontal hasta penúltima
+    # Cuadro interior
     left = xs[1]
     right = xs[-2]
     top = ys[1]
@@ -144,7 +166,11 @@ def detect_inner_rectangle(template):
     return left, top, right, bottom
 
 
-def fit_inside(image, max_width, max_height):
+def fit_inside(
+    image,
+    max_width,
+    max_height
+):
     width, height = image.size
 
     scale = min(
@@ -152,8 +178,15 @@ def fit_inside(image, max_width, max_height):
         max_height / height
     )
 
-    new_width = max(1, int(width * scale))
-    new_height = max(1, int(height * scale))
+    new_width = max(
+        1,
+        int(width * scale)
+    )
+
+    new_height = max(
+        1,
+        int(height * scale)
+    )
 
     return image.resize(
         (new_width, new_height),
@@ -161,7 +194,10 @@ def fit_inside(image, max_width, max_height):
     )
 
 
-def apply_watermark(canvas, inner_rect):
+def apply_watermark(
+    canvas,
+    inner_rect
+):
     watermark = render_pdf_page(
         pdf_path=WATERMARK_PATH,
         alpha=False
@@ -170,7 +206,7 @@ def apply_watermark(canvas, inner_rect):
     canvas_width, canvas_height = canvas.size
 
     # Ajustar la hoja completa de marca de agua
-    # a todo el recuadro blanco
+    # a todo el recuadro blanco del Display
     watermark = watermark.resize(
         (canvas_width, canvas_height),
         Image.Resampling.LANCZOS
@@ -182,12 +218,25 @@ def apply_watermark(canvas, inner_rect):
         for x in range(watermark.width):
             r, g, b, a = pixels[x, y]
 
-            # Eliminar el fondo blanco
-            if r > 245 and g > 245 and b > 245:
-                pixels[x, y] = (255, 255, 255, 0)
+            # Eliminar fondo blanco
+            if (
+                r > 245
+                and g > 245
+                and b > 245
+            ):
+                pixels[x, y] = (
+                    255,
+                    255,
+                    255,
+                    0
+                )
             else:
-                # Intensidad de la marca
-                pixels[x, y] = (r, g, b, 100)
+                pixels[x, y] = (
+                    r,
+                    g,
+                    b,
+                    100
+                )
 
     canvas.alpha_composite(
         watermark,
@@ -197,21 +246,50 @@ def apply_watermark(canvas, inner_rect):
 
 @app.post("/process")
 async def process_design(
-    file: UploadFile = File(...)
+    request: ProcessRequest
 ):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(
-            status_code=400,
-            detail="El archivo debe ser un PDF."
-        )
-
     try:
-        pdf_bytes = await file.read()
+        # Descargar PDF desde la URL recibida
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=60.0
+        ) as client:
+            response = await client.get(
+                request.file_url
+            )
 
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No se pudo descargar el PDF. "
+                    f"HTTP {response.status_code}"
+                )
+            )
+
+        pdf_bytes = response.content
+
+        if not pdf_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="El archivo descargado está vacío."
+            )
+
+        if not pdf_bytes.startswith(b"%PDF"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "El archivo descargado "
+                    "no parece ser un PDF válido."
+                )
+            )
+
+        # Renderizar plantilla
         template = render_pdf_page(
             pdf_path=TEMPLATE_PATH
         )
 
+        # Detectar área máxima permitida
         inner_rect = detect_inner_rectangle(
             template
         )
@@ -221,23 +299,27 @@ async def process_design(
         inner_width = right - left
         inner_height = bottom - top
 
+        # Renderizar diseño recibido
         design = render_pdf_page(
             pdf_bytes=pdf_bytes,
             alpha=False
         )
 
+        # Ajustar conservando proporción
         design = fit_inside(
             design,
             inner_width,
             inner_height
         )
 
+        # Crear Display final sin guías verdes
         canvas = Image.new(
             "RGBA",
             template.size,
             (255, 255, 255, 255)
         )
 
+        # Centrar diseño dentro del cuadro interior
         x = left + (
             inner_width - design.width
         ) // 2
@@ -251,11 +333,13 @@ async def process_design(
             (x, y)
         )
 
+        # Aplicar marca de agua oficial
         apply_watermark(
             canvas,
             inner_rect
         )
 
+        # Exportar únicamente PNG
         output = io.BytesIO()
 
         canvas.convert("RGB").save(
@@ -274,6 +358,9 @@ async def process_design(
                 'attachment; filename="diseno_procesado.png"'
             }
         )
+
+    except HTTPException:
+        raise
 
     except Exception as e:
         raise HTTPException(
