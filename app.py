@@ -164,52 +164,37 @@ def fit_inside(image, max_width, max_height):
 def apply_watermark(canvas, inner_rect):
     watermark = render_pdf_page(
         pdf_path=WATERMARK_PATH,
-        alpha=True
-    )
+        alpha=False
+    ).convert("RGBA")
 
     left, top, right, bottom = inner_rect
 
     inner_width = right - left
     inner_height = bottom - top
 
-    max_width = int(
-        inner_width * WATERMARK_WIDTH_RATIO
-    )
-
-    scale = max_width / watermark.width
-
-    new_width = max_width
-    new_height = int(watermark.height * scale)
-
-    if new_height > inner_height:
-        scale = inner_height / watermark.height
-        new_width = int(watermark.width * scale)
-        new_height = int(watermark.height * scale)
-
+    # Ajustar toda la hoja de marca de agua al área del diseño
     watermark = watermark.resize(
-        (new_width, new_height),
+        (inner_width, inner_height),
         Image.Resampling.LANCZOS
     )
 
-    if watermark.mode != "RGBA":
-        watermark = watermark.convert("RGBA")
+    # Convertir el blanco en transparencia
+    pixels = watermark.load()
 
-    alpha = watermark.getchannel("A")
+    for y in range(watermark.height):
+        for x in range(watermark.width):
+            r, g, b, a = pixels[x, y]
 
-    alpha = alpha.point(
-        lambda p: int(
-            p * WATERMARK_OPACITY / 255
-        )
-    )
-
-    watermark.putalpha(alpha)
-
-    x = left + (inner_width - new_width) // 2
-    y = top + (inner_height - new_height) // 2
+            # Todo lo casi blanco desaparece
+            if r > 245 and g > 245 and b > 245:
+                pixels[x, y] = (255, 255, 255, 0)
+            else:
+                # Mayor visibilidad de la marca
+                pixels[x, y] = (r, g, b, 150)
 
     canvas.alpha_composite(
         watermark,
-        (x, y)
+        (left, top)
     )
 
 
