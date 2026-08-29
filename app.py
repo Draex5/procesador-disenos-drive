@@ -1,17 +1,15 @@
 import io
 
 import fitz
-import httpx
 
 from PIL import Image
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import Response
-from pydantic import BaseModel
 
 
 app = FastAPI(
     title="Procesador de Diseños",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 TEMPLATE_PATH = "plantilla.pdf"
@@ -19,13 +17,8 @@ WATERMARK_PATH = "marca_agua.pdf"
 
 RENDER_SCALE = 2.0
 
-# Ajustaremos estos valores después de la prueba final
-WATERMARK_WIDTH_RATIO = 0.65
-WATERMARK_OPACITY = 90
-
-
-class ProcessRequest(BaseModel):
-    file_url: str
+# Opacidad de la marca de agua
+WATERMARK_OPACITY = 100
 
 
 @app.get("/")
@@ -41,45 +34,65 @@ def health():
     return {"status": "healthy"}
 
 
-def render_pdf_page(pdf_bytes=None, pdf_path=None, alpha=False):
+def render_pdf_page(
+    pdf_bytes=None,
+    pdf_path=None,
+    alpha=False
+):
+    """
+    Renderiza la primera página de un PDF como imagen Pillow.
+    """
+
     if pdf_bytes is not None:
         doc = fitz.open(
             stream=pdf_bytes,
             filetype="pdf"
         )
-    else:
+    elif pdf_path is not None:
         doc = fitz.open(pdf_path)
+    else:
+        raise ValueError(
+            "Debe proporcionarse pdf_bytes o pdf_path."
+        )
 
-    if len(doc) == 0:
+    try:
+        if len(doc) == 0:
+            raise ValueError(
+                "El PDF no contiene páginas."
+            )
+
+        page = doc[0]
+
+        matrix = fitz.Matrix(
+            RENDER_SCALE,
+            RENDER_SCALE
+        )
+
+        pix = page.get_pixmap(
+            matrix=matrix,
+            alpha=alpha
+        )
+
+        mode = "RGBA" if alpha else "RGB"
+
+        image = Image.frombytes(
+            mode,
+            [pix.width, pix.height],
+            pix.samples
+        )
+
+        return image
+
+    finally:
         doc.close()
-        raise ValueError("El PDF no contiene páginas")
-
-    page = doc[0]
-
-    matrix = fitz.Matrix(
-        RENDER_SCALE,
-        RENDER_SCALE
-    )
-
-    pix = page.get_pixmap(
-        matrix=matrix,
-        alpha=alpha
-    )
-
-    mode = "RGBA" if alpha else "RGB"
-
-    image = Image.frombytes(
-        mode,
-        [pix.width, pix.height],
-        pix.samples
-    )
-
-    doc.close()
-
-    return image
 
 
 def is_green(pixel):
+    """
+    Detecta aproximadamente las líneas verdes
+    de la plantilla oficial.
+    """
+
     r, g, b = pixel[:3]
 
     return (
@@ -89,7 +102,47 @@ def is_green(pixel):
     )
 
 
-def detect_inner_rectangle(template):
+def group_positions(
+    values,
+    tolerance=8
+):
+    """
+    Agrupa posiciones consecutivas detectadas
+    como pertenecientes a una misma línea.
+    """
+
+    if not values:
+        return []
+
+    groups = [[values[0]]]
+
+    for value in values[1:]:
+        if value - groups[-1][-1] <= tolerance:
+            groups[-1].append(value)
+        else:
+            groups.append([value])
+
+    return [
+        int(
+            sum(group) / len(group)
+        )
+        for group in groups
+    ]
+
+
+def detect_rectangles(template):
+    """
+    Detecta los cuadros verdes de la plantilla.
+
+    Devuelve:
+
+    outer_rect:
+        Display final.
+
+    inner_rect:
+        Área máxima del diseño.
+    """
+
     rgb = template.convert("RGB")
 
     width, height = rgb.size
@@ -101,38 +154,35 @@ def detect_inner_rectangle(template):
 
     step = 2
 
-    for y in range(0, height, step):
-        for x in range(0, width, step):
-            if is_green(pixels[x, y]):
+    for y in range(
+        0,
+        height,
+        step
+    ):
+        for x in range(
+            0,
+            width,
+            step
+        ):
+            if is_green(
+                pixels[x, y]
+            ):
                 vertical_scores[x] += 1
                 horizontal_scores[y] += 1
 
     vertical_candidates = [
-        i for i, score in enumerate(vertical_scores)
+        i
+        for i, score
+        in enumerate(vertical_scores)
         if score > height * 0.08 / step
     ]
 
     horizontal_candidates = [
-        i for i, score in enumerate(horizontal_scores)
+        i
+        for i, score
+        in enumerate(horizontal_scores)
         if score > width * 0.08 / step
     ]
-
-    def group_positions(values, tolerance=8):
-        if not values:
-            return []
-
-        groups = [[values[0]]]
-
-        for value in values[1:]:
-            if value - groups[-1][-1] <= tolerance:
-                groups[-1].append(value)
-            else:
-                groups.append([value])
-
-        return [
-            int(sum(group) / len(group))
-            for group in groups
-        ]
 
     xs = group_positions(
         vertical_candidates
@@ -142,28 +192,63 @@ def detect_inner_rectangle(template):
         horizontal_candidates
     )
 
-    if len(xs) < 4 or len(ys) < 4:
+    if (
+        len(xs) < 4
+        or len(ys) < 4
+    ):
         raise ValueError(
-            "No pude detectar correctamente los cuatro lados "
-            "de los cuadros verdes de la plantilla."
+            "No pude detectar correctamente "
+            "los cuadros verdes de la plantilla."
         )
 
     xs = sorted(xs)
     ys = sorted(ys)
 
-    # Cuadro interior
-    left = xs[1]
-    right = xs[-2]
-    top = ys[1]
-    bottom = ys[-2]
+    # Cuadro exterior = Display final
+    outer_left = xs[0]
+    outer_right = xs[-1]
+    outer_top = ys[0]
+    outer_bottom = ys[-1]
 
-    if right <= left or bottom <= top:
+    # Cuadro interior = área máxima del diseño
+    inner_left = xs[1]
+    inner_right = xs[-2]
+    inner_top = ys[1]
+    inner_bottom = ys[-2]
+
+    if (
+        outer_right <= outer_left
+        or outer_bottom <= outer_top
+    ):
         raise ValueError(
-            "Las líneas verdes fueron detectadas, "
-            "pero el área interior no es válida."
+            "El cuadro exterior detectado "
+            "no es válido."
         )
 
-    return left, top, right, bottom
+    if (
+        inner_right <= inner_left
+        or inner_bottom <= inner_top
+    ):
+        raise ValueError(
+            "El cuadro interior detectado "
+            "no es válido."
+        )
+
+    outer_rect = (
+        outer_left,
+        outer_top,
+        outer_right,
+        outer_bottom
+    )
+
+    inner_rect = (
+        inner_left,
+        inner_top,
+        inner_right,
+        inner_bottom
+    )
+
+    return outer_rect, inner_rect
 
 
 def fit_inside(
@@ -171,7 +256,17 @@ def fit_inside(
     max_width,
     max_height
 ):
+    """
+    Ajusta la imagen al área máxima disponible
+    sin recortar ni deformar.
+    """
+
     width, height = image.size
+
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            "El diseño tiene dimensiones inválidas."
+        )
 
     scale = min(
         max_width / width,
@@ -180,45 +275,45 @@ def fit_inside(
 
     new_width = max(
         1,
-        int(width * scale)
+        round(width * scale)
     )
 
     new_height = max(
         1,
-        int(height * scale)
+        round(height * scale)
     )
 
     return image.resize(
-        (new_width, new_height),
+        (
+            new_width,
+            new_height
+        ),
         Image.Resampling.LANCZOS
     )
 
 
-def apply_watermark(
-    canvas,
-    inner_rect
+def make_white_transparent(
+    image,
+    opacity=100
 ):
-    watermark = render_pdf_page(
-        pdf_path=WATERMARK_PATH,
-        alpha=False
-    ).convert("RGBA")
+    """
+    Convierte el fondo blanco de una imagen
+    en transparente y aplica opacidad
+    al resto de la marca de agua.
+    """
 
-    canvas_width, canvas_height = canvas.size
+    image = image.convert("RGBA")
 
-    # Ajustar la hoja completa de marca de agua
-    # a todo el recuadro blanco del Display
-    watermark = watermark.resize(
-        (canvas_width, canvas_height),
-        Image.Resampling.LANCZOS
-    )
+    pixels = image.load()
 
-    pixels = watermark.load()
-
-    for y in range(watermark.height):
-        for x in range(watermark.width):
+    for y in range(
+        image.height
+    ):
+        for x in range(
+            image.width
+        ):
             r, g, b, a = pixels[x, y]
 
-            # Eliminar fondo blanco
             if (
                 r > 245
                 and g > 245
@@ -235,8 +330,34 @@ def apply_watermark(
                     r,
                     g,
                     b,
-                    100
+                    opacity
                 )
+
+    return image
+
+
+def apply_watermark(
+    canvas
+):
+    """
+    Distribuye la hoja oficial de marca de agua
+    sobre todo el recuadro blanco del Display.
+    """
+
+    watermark = render_pdf_page(
+        pdf_path=WATERMARK_PATH,
+        alpha=False
+    )
+
+    watermark = watermark.resize(
+        canvas.size,
+        Image.Resampling.LANCZOS
+    )
+
+    watermark = make_white_transparent(
+        watermark,
+        opacity=WATERMARK_OPACITY
+    )
 
     canvas.alpha_composite(
         watermark,
@@ -244,60 +365,97 @@ def apply_watermark(
     )
 
 
-@app.post("/process")
+@app.post(
+    "/process",
+    response_class=Response
+)
 async def process_design(
-    request: ProcessRequest
+    file: UploadFile = File(...)
 ):
     try:
-        # Descargar PDF desde la URL recibida
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=60.0
-        ) as client:
-            response = await client.get(
-                request.file_url
+        # Validar tipo declarado por el cliente
+        if (
+            file.content_type
+            and file.content_type
+            not in (
+                "application/pdf",
+                "application/octet-stream"
             )
-
-        if response.status_code != 200:
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "No se pudo descargar el PDF. "
-                    f"HTTP {response.status_code}"
+                    "El archivo enviado debe ser PDF. "
+                    f"Tipo recibido: {file.content_type}"
                 )
             )
 
-        pdf_bytes = response.content
+        # Leer PDF directamente desde multipart/form-data
+        pdf_bytes = await file.read()
 
         if not pdf_bytes:
             raise HTTPException(
                 status_code=400,
-                detail="El archivo descargado está vacío."
+                detail=(
+                    "El archivo recibido está vacío."
+                )
             )
 
-        if not pdf_bytes.startswith(b"%PDF"):
+        if not pdf_bytes.startswith(
+            b"%PDF"
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "El archivo descargado "
+                    "El archivo recibido "
                     "no parece ser un PDF válido."
                 )
             )
 
-        # Renderizar plantilla
+        # Renderizar plantilla oficial
         template = render_pdf_page(
-            pdf_path=TEMPLATE_PATH
+            pdf_path=TEMPLATE_PATH,
+            alpha=False
         )
 
-        # Detectar área máxima permitida
-        inner_rect = detect_inner_rectangle(
-            template
+        # Detectar:
+        # - cuadro exterior = Display final
+        # - cuadro interior = área máxima del diseño
+        outer_rect, inner_rect = (
+            detect_rectangles(
+                template
+            )
         )
 
-        left, top, right, bottom = inner_rect
+        (
+            outer_left,
+            outer_top,
+            outer_right,
+            outer_bottom
+        ) = outer_rect
 
-        inner_width = right - left
-        inner_height = bottom - top
+        (
+            inner_left,
+            inner_top,
+            inner_right,
+            inner_bottom
+        ) = inner_rect
+
+        display_width = (
+            outer_right - outer_left
+        )
+
+        display_height = (
+            outer_bottom - outer_top
+        )
+
+        inner_width = (
+            inner_right - inner_left
+        )
+
+        inner_height = (
+            inner_bottom - inner_top
+        )
 
         # Renderizar diseño recibido
         design = render_pdf_page(
@@ -305,44 +463,98 @@ async def process_design(
             alpha=False
         )
 
-        # Ajustar conservando proporción
+        # Ajustar proporcionalmente
+        # dentro del cuadro interior
         design = fit_inside(
             design,
             inner_width,
             inner_height
         )
 
-        # Crear Display final sin guías verdes
+        # Crear únicamente el Display final.
+        # No copiamos la plantilla:
+        # por lo tanto no salen líneas verdes ni guías.
         canvas = Image.new(
             "RGBA",
-            template.size,
-            (255, 255, 255, 255)
+            (
+                display_width,
+                display_height
+            ),
+            (
+                255,
+                255,
+                255,
+                255
+            )
+        )
+
+        # Convertir coordenadas del área interior
+        # desde la plantilla al nuevo canvas.
+        relative_inner_left = (
+            inner_left - outer_left
+        )
+
+        relative_inner_top = (
+            inner_top - outer_top
+        )
+
+        relative_inner_right = (
+            inner_right - outer_left
+        )
+
+        relative_inner_bottom = (
+            inner_bottom - outer_top
+        )
+
+        relative_inner_width = (
+            relative_inner_right
+            - relative_inner_left
+        )
+
+        relative_inner_height = (
+            relative_inner_bottom
+            - relative_inner_top
         )
 
         # Centrar diseño dentro del cuadro interior
-        x = left + (
-            inner_width - design.width
-        ) // 2
+        x = (
+            relative_inner_left
+            + (
+                relative_inner_width
+                - design.width
+            ) // 2
+        )
 
-        y = top + (
-            inner_height - design.height
-        ) // 2
+        y = (
+            relative_inner_top
+            + (
+                relative_inner_height
+                - design.height
+            ) // 2
+        )
 
         canvas.alpha_composite(
-            design.convert("RGBA"),
-            (x, y)
+            design.convert(
+                "RGBA"
+            ),
+            (
+                x,
+                y
+            )
         )
 
         # Aplicar marca de agua oficial
+        # sobre todo el Display final
         apply_watermark(
-            canvas,
-            inner_rect
+            canvas
         )
 
         # Exportar únicamente PNG
         output = io.BytesIO()
 
-        canvas.convert("RGB").save(
+        canvas.convert(
+            "RGB"
+        ).save(
             output,
             format="PNG",
             optimize=True
@@ -362,8 +574,20 @@ async def process_design(
     except HTTPException:
         raise
 
+    except fitz.FileDataError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "El archivo recibido no pudo "
+                "abrirse como PDF."
+            )
+        )
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=str(e)
         )
+
+    finally:
+        await file.close()
