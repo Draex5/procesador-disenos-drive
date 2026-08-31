@@ -1,15 +1,18 @@
 import io
+import re
 
 import fitz
+import httpx
 
 from PIL import Image
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
+from pydantic import BaseModel
 
 
 app = FastAPI(
     title="Procesador de Diseños",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 TEMPLATE_PATH = "plantilla.pdf"
@@ -19,6 +22,10 @@ RENDER_SCALE = 2.0
 
 # Opacidad de la marca de agua
 WATERMARK_OPACITY = 100
+
+
+class DriveRequest(BaseModel):
+    drive_url: str
 
 
 @app.get("/")
@@ -31,7 +38,107 @@ def inicio():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy"
+    }
+
+
+def get_google_drive_file_id(url):
+    """
+    Extrae el ID de un archivo desde distintos
+    formatos de enlaces de Google Drive.
+    """
+
+    patterns = [
+        r"/file/d/([a-zA-Z0-9_-]+)",
+        r"[?&]id=([a-zA-Z0-9_-]+)"
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, url)
+
+        if match:
+            return match.group(1)
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "No pude obtener el ID del archivo "
+            "de Google Drive."
+        )
+    )
+
+
+async def download_pdf_from_drive(drive_url):
+    """
+    Descarga un PDF público desde Google Drive.
+    """
+
+    file_id = get_google_drive_file_id(
+        drive_url
+    )
+
+    download_url = (
+        "https://drive.usercontent.google.com/"
+        f"download?id={file_id}"
+        "&export=download"
+        "&confirm=t"
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=60.0
+        ) as client:
+
+            response = await client.get(
+                download_url
+            )
+
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "No pude conectar con Google Drive: "
+                f"{str(e)}"
+            )
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Google Drive no permitió descargar "
+                f"el archivo. HTTP {response.status_code}"
+            )
+        )
+
+    pdf_bytes = response.content
+
+    if not pdf_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Google Drive devolvió "
+                "un archivo vacío."
+            )
+        )
+
+    if not pdf_bytes.startswith(
+        b"%PDF"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "El enlace de Google Drive "
+                "no devolvió un PDF. "
+                "Comprueba que el archivo esté "
+                "compartido como "
+                "'Cualquier persona con el enlace'."
+            )
+        )
+
+    return pdf_bytes
 
 
 def render_pdf_page(
@@ -40,7 +147,8 @@ def render_pdf_page(
     alpha=False
 ):
     """
-    Renderiza la primera página de un PDF como imagen Pillow.
+    Renderiza la primera página de un PDF
+    como imagen Pillow.
     """
 
     if pdf_bytes is not None:
@@ -48,11 +156,16 @@ def render_pdf_page(
             stream=pdf_bytes,
             filetype="pdf"
         )
+
     elif pdf_path is not None:
-        doc = fitz.open(pdf_path)
+        doc = fitz.open(
+            pdf_path
+        )
+
     else:
         raise ValueError(
-            "Debe proporcionarse pdf_bytes o pdf_path."
+            "Debe proporcionarse "
+            "pdf_bytes o pdf_path."
         )
 
     try:
@@ -73,11 +186,18 @@ def render_pdf_page(
             alpha=alpha
         )
 
-        mode = "RGBA" if alpha else "RGB"
+        mode = (
+            "RGBA"
+            if alpha
+            else "RGB"
+        )
 
         image = Image.frombytes(
             mode,
-            [pix.width, pix.height],
+            [
+                pix.width,
+                pix.height
+            ],
             pix.samples
         )
 
@@ -114,25 +234,38 @@ def group_positions(
     if not values:
         return []
 
-    groups = [[values[0]]]
+    groups = [
+        [values[0]]
+    ]
 
     for value in values[1:]:
-        if value - groups[-1][-1] <= tolerance:
-            groups[-1].append(value)
+        if (
+            value
+            - groups[-1][-1]
+            <= tolerance
+        ):
+            groups[-1].append(
+                value
+            )
         else:
-            groups.append([value])
+            groups.append(
+                [value]
+            )
 
     return [
         int(
-            sum(group) / len(group)
+            sum(group)
+            / len(group)
         )
-        for group in groups
+        for group
+        in groups
     ]
 
 
 def detect_rectangles(template):
     """
-    Detecta los cuadros verdes de la plantilla.
+    Detecta los cuadros verdes
+    de la plantilla.
 
     Devuelve:
 
@@ -143,12 +276,19 @@ def detect_rectangles(template):
         Área máxima del diseño.
     """
 
-    rgb = template.convert("RGB")
+    rgb = template.convert(
+        "RGB"
+    )
 
     width, height = rgb.size
 
-    vertical_scores = [0] * width
-    horizontal_scores = [0] * height
+    vertical_scores = [
+        0
+    ] * width
+
+    horizontal_scores = [
+        0
+    ] * height
 
     pixels = rgb.load()
 
@@ -173,15 +313,29 @@ def detect_rectangles(template):
     vertical_candidates = [
         i
         for i, score
-        in enumerate(vertical_scores)
-        if score > height * 0.08 / step
+        in enumerate(
+            vertical_scores
+        )
+        if (
+            score
+            > height
+            * 0.08
+            / step
+        )
     ]
 
     horizontal_candidates = [
         i
         for i, score
-        in enumerate(horizontal_scores)
-        if score > width * 0.08 / step
+        in enumerate(
+            horizontal_scores
+        )
+        if (
+            score
+            > width
+            * 0.08
+            / step
+        )
     ]
 
     xs = group_positions(
@@ -198,11 +352,17 @@ def detect_rectangles(template):
     ):
         raise ValueError(
             "No pude detectar correctamente "
-            "los cuadros verdes de la plantilla."
+            "los cuadros verdes "
+            "de la plantilla."
         )
 
-    xs = sorted(xs)
-    ys = sorted(ys)
+    xs = sorted(
+        xs
+    )
+
+    ys = sorted(
+        ys
+    )
 
     # Cuadro exterior = Display final
     outer_left = xs[0]
@@ -248,7 +408,10 @@ def detect_rectangles(template):
         inner_bottom
     )
 
-    return outer_rect, inner_rect
+    return (
+        outer_rect,
+        inner_rect
+    )
 
 
 def fit_inside(
@@ -263,9 +426,13 @@ def fit_inside(
 
     width, height = image.size
 
-    if width <= 0 or height <= 0:
+    if (
+        width <= 0
+        or height <= 0
+    ):
         raise ValueError(
-            "El diseño tiene dimensiones inválidas."
+            "El diseño tiene "
+            "dimensiones inválidas."
         )
 
     scale = min(
@@ -275,12 +442,16 @@ def fit_inside(
 
     new_width = max(
         1,
-        round(width * scale)
+        round(
+            width * scale
+        )
     )
 
     new_height = max(
         1,
-        round(height * scale)
+        round(
+            height * scale
+        )
     )
 
     return image.resize(
@@ -302,7 +473,9 @@ def make_white_transparent(
     al resto de la marca de agua.
     """
 
-    image = image.convert("RGBA")
+    image = image.convert(
+        "RGBA"
+    )
 
     pixels = image.load()
 
@@ -312,7 +485,9 @@ def make_white_transparent(
         for x in range(
             image.width
         ):
-            r, g, b, a = pixels[x, y]
+            r, g, b, a = (
+                pixels[x, y]
+            )
 
             if (
                 r > 245
@@ -336,9 +511,7 @@ def make_white_transparent(
     return image
 
 
-def apply_watermark(
-    canvas
-):
+def apply_watermark(canvas):
     """
     Distribuye la hoja oficial de marca de agua
     sobre todo el recuadro blanco del Display.
@@ -354,14 +527,19 @@ def apply_watermark(
         Image.Resampling.LANCZOS
     )
 
-    watermark = make_white_transparent(
-        watermark,
-        opacity=WATERMARK_OPACITY
+    watermark = (
+        make_white_transparent(
+            watermark,
+            opacity=WATERMARK_OPACITY
+        )
     )
 
     canvas.alpha_composite(
         watermark,
-        (0, 0)
+        (
+            0,
+            0
+        )
     )
 
 
@@ -370,47 +548,15 @@ def apply_watermark(
     response_class=Response
 )
 async def process_design(
-    file: UploadFile = File(...)
+    request: DriveRequest
 ):
     try:
-        # Validar tipo declarado por el cliente
-        if (
-            file.content_type
-            and file.content_type
-            not in (
-                "application/pdf",
-                "application/octet-stream"
+        # Descargar PDF desde Google Drive
+        pdf_bytes = (
+            await download_pdf_from_drive(
+                request.drive_url
             )
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "El archivo enviado debe ser PDF. "
-                    f"Tipo recibido: {file.content_type}"
-                )
-            )
-
-        # Leer PDF directamente desde multipart/form-data
-        pdf_bytes = await file.read()
-
-        if not pdf_bytes:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "El archivo recibido está vacío."
-                )
-            )
-
-        if not pdf_bytes.startswith(
-            b"%PDF"
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "El archivo recibido "
-                    "no parece ser un PDF válido."
-                )
-            )
+        )
 
         # Renderizar plantilla oficial
         template = render_pdf_page(
@@ -442,22 +588,26 @@ async def process_design(
         ) = inner_rect
 
         display_width = (
-            outer_right - outer_left
+            outer_right
+            - outer_left
         )
 
         display_height = (
-            outer_bottom - outer_top
+            outer_bottom
+            - outer_top
         )
 
         inner_width = (
-            inner_right - inner_left
+            inner_right
+            - inner_left
         )
 
         inner_height = (
-            inner_bottom - inner_top
+            inner_bottom
+            - inner_top
         )
 
-        # Renderizar diseño recibido
+        # Renderizar diseño descargado
         design = render_pdf_page(
             pdf_bytes=pdf_bytes,
             alpha=False
@@ -473,7 +623,7 @@ async def process_design(
 
         # Crear únicamente el Display final.
         # No copiamos la plantilla:
-        # por lo tanto no salen líneas verdes ni guías.
+        # no salen líneas verdes ni guías.
         canvas = Image.new(
             "RGBA",
             (
@@ -491,19 +641,23 @@ async def process_design(
         # Convertir coordenadas del área interior
         # desde la plantilla al nuevo canvas.
         relative_inner_left = (
-            inner_left - outer_left
+            inner_left
+            - outer_left
         )
 
         relative_inner_top = (
-            inner_top - outer_top
+            inner_top
+            - outer_top
         )
 
         relative_inner_right = (
-            inner_right - outer_left
+            inner_right
+            - outer_left
         )
 
         relative_inner_bottom = (
-            inner_bottom - outer_top
+            inner_bottom
+            - outer_top
         )
 
         relative_inner_width = (
@@ -560,7 +714,9 @@ async def process_design(
             optimize=True
         )
 
-        output.seek(0)
+        output.seek(
+            0
+        )
 
         return Response(
             content=output.getvalue(),
@@ -578,8 +734,8 @@ async def process_design(
         raise HTTPException(
             status_code=400,
             detail=(
-                "El archivo recibido no pudo "
-                "abrirse como PDF."
+                "El archivo descargado "
+                "no pudo abrirse como PDF."
             )
         )
 
@@ -588,6 +744,3 @@ async def process_design(
             status_code=500,
             detail=str(e)
         )
-
-    finally:
-        await file.close()
