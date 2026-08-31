@@ -18,20 +18,26 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="Procesador de Diseños",
-    version="1.4.0"
+    version="1.5.0"
 )
 
 
 TEMPLATE_PATH = "plantilla.pdf"
 WATERMARK_PATH = "marca_agua.pdf"
 
-RENDER_SCALE = 2.0
+# Calidad de renderizado.
+# 300 DPI ofrece buena calidad para impresión
+# sin disparar demasiado el consumo de memoria.
+OUTPUT_DPI = 300
+
+# Protección para Render.
+# Evita imágenes gigantes que puedan agotar RAM.
+MAX_LONG_SIDE = 12000
 
 # Opacidad de la marca de agua
 WATERMARK_OPACITY = 100
 
 # Carpeta temporal para los PNG generados por GPT.
-# Render permite escribir en /tmp.
 OUTPUT_DIR = Path("/tmp/disenos_procesados")
 OUTPUT_DIR.mkdir(
     parents=True,
@@ -39,7 +45,6 @@ OUTPUT_DIR.mkdir(
 )
 
 # URL pública de esta API.
-# Puede sobrescribirse mediante variable de entorno.
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
     "https://procesador-disenos-drive.onrender.com"
@@ -169,11 +174,19 @@ async def download_pdf_from_drive(drive_url):
 def render_pdf_page(
     pdf_bytes=None,
     pdf_path=None,
-    alpha=False
+    alpha=False,
+    dpi=OUTPUT_DPI,
+    target_width=None,
+    target_height=None
 ):
     """
     Renderiza la primera página de un PDF
     como imagen Pillow.
+
+    Si se proporcionan target_width y target_height,
+    renderiza directamente desde el PDF al tamaño
+    máximo necesario para evitar ampliar después
+    una imagen rasterizada pequeña.
     """
 
     if pdf_bytes is not None:
@@ -201,15 +214,47 @@ def render_pdf_page(
 
         page = doc[0]
 
-        matrix = pymupdf.Matrix(
-            RENDER_SCALE,
-            RENDER_SCALE
-        )
+        page_width = page.rect.width
+        page_height = page.rect.height
 
-        pix = page.get_pixmap(
-            matrix=matrix,
-            alpha=alpha
-        )
+        if (
+            page_width <= 0
+            or page_height <= 0
+        ):
+            raise ValueError(
+                "La página PDF tiene "
+                "dimensiones inválidas."
+            )
+
+        if (
+            target_width is not None
+            and target_height is not None
+        ):
+            scale = min(
+                target_width / page_width,
+                target_height / page_height
+            )
+
+            scale = max(
+                scale,
+                0.01
+            )
+
+            matrix = pymupdf.Matrix(
+                scale,
+                scale
+            )
+
+            pix = page.get_pixmap(
+                matrix=matrix,
+                alpha=alpha
+            )
+
+        else:
+            pix = page.get_pixmap(
+                dpi=dpi,
+                alpha=alpha
+            )
 
         mode = (
             "RGBA"
@@ -219,10 +264,10 @@ def render_pdf_page(
 
         image = Image.frombytes(
             mode,
-            [
+            (
                 pix.width,
                 pix.height
-            ],
+            ),
             pix.samples
         )
 
@@ -230,6 +275,62 @@ def render_pdf_page(
 
     finally:
         doc.close()
+
+
+def limit_dimensions(
+    width,
+    height,
+    max_long_side=MAX_LONG_SIDE
+):
+    """
+    Limita las dimensiones máximas manteniendo
+    siempre la proporción.
+
+    Devuelve:
+    width,
+    height,
+    factor_aplicado
+    """
+
+    width = int(width)
+    height = int(height)
+
+    longest = max(
+        width,
+        height
+    )
+
+    if longest <= max_long_side:
+        return (
+            width,
+            height,
+            1.0
+        )
+
+    scale = (
+        max_long_side
+        / longest
+    )
+
+    new_width = max(
+        1,
+        round(
+            width * scale
+        )
+    )
+
+    new_height = max(
+        1,
+        round(
+            height * scale
+        )
+    )
+
+    return (
+        new_width,
+        new_height,
+        scale
+    )
 
 
 def is_green(pixel):
@@ -291,8 +392,6 @@ def detect_rectangles(template):
     """
     Detecta los cuadros verdes
     de la plantilla.
-
-    Devuelve:
 
     outer_rect:
         Display final.
@@ -389,13 +488,11 @@ def detect_rectangles(template):
         ys
     )
 
-    # Cuadro exterior = Display final
     outer_left = xs[0]
     outer_right = xs[-1]
     outer_top = ys[0]
     outer_bottom = ys[-1]
 
-    # Cuadro interior = área máxima del diseño
     inner_left = xs[1]
     inner_right = xs[-2]
     inner_top = ys[1]
@@ -538,19 +635,26 @@ def make_white_transparent(
 
 def apply_watermark(canvas):
     """
-    Distribuye la hoja oficial de marca de agua
-    sobre todo el recuadro blanco del Display.
+    Aplica la marca de agua oficial
+    sobre todo el Display final.
+
+    La marca se renderiza directamente
+    a la resolución final para evitar
+    pérdida de nitidez.
     """
 
     watermark = render_pdf_page(
         pdf_path=WATERMARK_PATH,
-        alpha=False
+        alpha=False,
+        target_width=canvas.width,
+        target_height=canvas.height
     )
 
-    watermark = watermark.resize(
-        canvas.size,
-        Image.Resampling.LANCZOS
-    )
+    if watermark.size != canvas.size:
+        watermark = watermark.resize(
+            canvas.size,
+            Image.Resampling.LANCZOS
+        )
 
     watermark = make_white_transparent(
         watermark,
@@ -570,21 +674,21 @@ def generate_processed_png(pdf_bytes):
     """
     Genera el PNG final a partir del PDF recibido.
 
-    Esta función contiene la lógica común utilizada
-    tanto por /process como por /process-gpt.
-
-    Devuelve los bytes del PNG final.
+    Renderiza la plantilla a 300 DPI,
+    mantiene proporciones,
+    limita la resolución máxima
+    para proteger la memoria de Render
+    y exporta únicamente PNG.
     """
 
     # Renderizar plantilla oficial
     template = render_pdf_page(
         pdf_path=TEMPLATE_PATH,
-        alpha=False
+        alpha=False,
+        dpi=OUTPUT_DPI
     )
 
-    # Detectar:
-    # - cuadro exterior = Display final
-    # - cuadro interior = área máxima del diseño
+    # Detectar cuadros
     outer_rect, inner_rect = (
         detect_rectangles(
             template
@@ -605,43 +709,124 @@ def generate_processed_png(pdf_bytes):
         inner_bottom
     ) = inner_rect
 
-    display_width = (
+    original_display_width = (
         outer_right
         - outer_left
     )
 
-    display_height = (
+    original_display_height = (
         outer_bottom
         - outer_top
     )
 
-    inner_width = (
+    # Limitar tamaño máximo para evitar
+    # problemas de RAM en Render
+    (
+        display_width,
+        display_height,
+        output_scale
+    ) = limit_dimensions(
+        original_display_width,
+        original_display_height
+    )
+
+    # Escalar coordenadas de la plantilla
+    # al tamaño final limitado
+    outer_left_scaled = (
+        outer_left
+        * output_scale
+    )
+
+    outer_top_scaled = (
+        outer_top
+        * output_scale
+    )
+
+    inner_left_scaled = (
+        inner_left
+        * output_scale
+    )
+
+    inner_top_scaled = (
+        inner_top
+        * output_scale
+    )
+
+    inner_right_scaled = (
         inner_right
-        - inner_left
+        * output_scale
     )
 
-    inner_height = (
+    inner_bottom_scaled = (
         inner_bottom
-        - inner_top
+        * output_scale
     )
 
-    # Renderizar diseño descargado
+    # Convertir coordenadas internas
+    # a coordenadas relativas del canvas
+    relative_inner_left = round(
+        inner_left_scaled
+        - outer_left_scaled
+    )
+
+    relative_inner_top = round(
+        inner_top_scaled
+        - outer_top_scaled
+    )
+
+    relative_inner_right = round(
+        inner_right_scaled
+        - outer_left_scaled
+    )
+
+    relative_inner_bottom = round(
+        inner_bottom_scaled
+        - outer_top_scaled
+    )
+
+    relative_inner_width = (
+        relative_inner_right
+        - relative_inner_left
+    )
+
+    relative_inner_height = (
+        relative_inner_bottom
+        - relative_inner_top
+    )
+
+    if (
+        relative_inner_width <= 0
+        or relative_inner_height <= 0
+    ):
+        raise ValueError(
+            "El área interior calculada "
+            "no es válida."
+        )
+
+    # Renderizar directamente el diseño
+    # desde el PDF al tamaño máximo necesario.
+    #
+    # Esto evita rasterizar pequeño
+    # y después ampliar con Pillow.
     design = render_pdf_page(
         pdf_bytes=pdf_bytes,
-        alpha=False
+        alpha=False,
+        target_width=relative_inner_width,
+        target_height=relative_inner_height
     )
 
-    # Ajustar proporcionalmente
-    # dentro del cuadro interior
-    design = fit_inside(
-        design,
-        inner_width,
-        inner_height
-    )
+    # Protección por posibles redondeos
+    if (
+        design.width > relative_inner_width
+        or design.height > relative_inner_height
+    ):
+        design = fit_inside(
+            design,
+            relative_inner_width,
+            relative_inner_height
+        )
 
-    # Crear únicamente el Display final.
-    # No copiamos la plantilla:
-    # no salen líneas verdes ni guías.
+    # Crear únicamente el Display final
     canvas = Image.new(
         "RGBA",
         (
@@ -654,38 +839,6 @@ def generate_processed_png(pdf_bytes):
             255,
             255
         )
-    )
-
-    # Convertir coordenadas del área interior
-    # desde la plantilla al nuevo canvas.
-    relative_inner_left = (
-        inner_left
-        - outer_left
-    )
-
-    relative_inner_top = (
-        inner_top
-        - outer_top
-    )
-
-    relative_inner_right = (
-        inner_right
-        - outer_left
-    )
-
-    relative_inner_bottom = (
-        inner_bottom
-        - outer_top
-    )
-
-    relative_inner_width = (
-        relative_inner_right
-        - relative_inner_left
-    )
-
-    relative_inner_height = (
-        relative_inner_bottom
-        - relative_inner_top
     )
 
     # Centrar diseño dentro del cuadro interior
@@ -716,7 +869,6 @@ def generate_processed_png(pdf_bytes):
     )
 
     # Aplicar marca de agua oficial
-    # sobre todo el Display final
     apply_watermark(
         canvas
     )
@@ -724,12 +876,19 @@ def generate_processed_png(pdf_bytes):
     # Exportar únicamente PNG
     output = io.BytesIO()
 
-    canvas.convert(
+    final_image = canvas.convert(
         "RGB"
-    ).save(
+    )
+
+    final_image.save(
         output,
         format="PNG",
-        optimize=True
+        optimize=True,
+        compress_level=6,
+        dpi=(
+            OUTPUT_DPI,
+            OUTPUT_DPI
+        )
     )
 
     output.seek(
@@ -750,18 +909,15 @@ async def process_design(
     Endpoint original.
 
     Devuelve directamente el PNG binario.
-    Se conserva para Swagger y uso directo.
     """
 
     try:
-        # Descargar PDF desde Google Drive
         pdf_bytes = (
             await download_pdf_from_drive(
                 request.drive_url
             )
         )
 
-        # Generar PNG final
         png_bytes = generate_processed_png(
             pdf_bytes
         )
@@ -801,26 +957,21 @@ async def process_design_gpt(
     """
     Endpoint especial para GPT Actions.
 
-    Procesa exactamente igual que /process,
-    pero en lugar de devolver el PNG binario,
-    guarda temporalmente el archivo y devuelve
-    un JSON con una URL de descarga.
+    Guarda temporalmente el PNG
+    y devuelve una URL de descarga.
     """
 
     try:
-        # Descargar PDF desde Google Drive
         pdf_bytes = (
             await download_pdf_from_drive(
                 request.drive_url
             )
         )
 
-        # Generar PNG final
         png_bytes = generate_processed_png(
             pdf_bytes
         )
 
-        # Crear identificador único
         file_id = uuid4().hex
 
         output_path = (
@@ -828,7 +979,6 @@ async def process_design_gpt(
             / f"{file_id}.png"
         )
 
-        # Guardar PNG temporalmente
         output_path.write_bytes(
             png_bytes
         )
@@ -874,8 +1024,6 @@ def download_processed_design(
     mediante /process-gpt.
     """
 
-    # uuid4().hex tiene exactamente
-    # 32 caracteres hexadecimales.
     if not re.fullmatch(
         r"[a-f0-9]{32}",
         file_id
