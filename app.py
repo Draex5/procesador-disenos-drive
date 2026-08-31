@@ -1,19 +1,26 @@
+# Desarrollado por Diego Damas + ChatGPT
+
 import io
 import re
+import os
+
+from pathlib import Path
+from uuid import uuid4
 
 import pymupdf
 import httpx
 
 from PIL import Image
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, FileResponse
 from pydantic import BaseModel
 
 
 app = FastAPI(
     title="Procesador de Diseños",
-    version="1.3.1"
+    version="1.4.0"
 )
+
 
 TEMPLATE_PATH = "plantilla.pdf"
 WATERMARK_PATH = "marca_agua.pdf"
@@ -22,6 +29,21 @@ RENDER_SCALE = 2.0
 
 # Opacidad de la marca de agua
 WATERMARK_OPACITY = 100
+
+# Carpeta temporal para los PNG generados por GPT.
+# Render permite escribir en /tmp.
+OUTPUT_DIR = Path("/tmp/disenos_procesados")
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+# URL pública de esta API.
+# Puede sobrescribirse mediante variable de entorno.
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    "https://procesador-disenos-drive.onrender.com"
+).rstrip("/")
 
 
 class DriveRequest(BaseModel):
@@ -55,7 +77,10 @@ def get_google_drive_file_id(url):
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, url)
+        match = re.search(
+            pattern,
+            url
+        )
 
         if match:
             return match.group(1)
@@ -541,6 +566,179 @@ def apply_watermark(canvas):
     )
 
 
+def generate_processed_png(pdf_bytes):
+    """
+    Genera el PNG final a partir del PDF recibido.
+
+    Esta función contiene la lógica común utilizada
+    tanto por /process como por /process-gpt.
+
+    Devuelve los bytes del PNG final.
+    """
+
+    # Renderizar plantilla oficial
+    template = render_pdf_page(
+        pdf_path=TEMPLATE_PATH,
+        alpha=False
+    )
+
+    # Detectar:
+    # - cuadro exterior = Display final
+    # - cuadro interior = área máxima del diseño
+    outer_rect, inner_rect = (
+        detect_rectangles(
+            template
+        )
+    )
+
+    (
+        outer_left,
+        outer_top,
+        outer_right,
+        outer_bottom
+    ) = outer_rect
+
+    (
+        inner_left,
+        inner_top,
+        inner_right,
+        inner_bottom
+    ) = inner_rect
+
+    display_width = (
+        outer_right
+        - outer_left
+    )
+
+    display_height = (
+        outer_bottom
+        - outer_top
+    )
+
+    inner_width = (
+        inner_right
+        - inner_left
+    )
+
+    inner_height = (
+        inner_bottom
+        - inner_top
+    )
+
+    # Renderizar diseño descargado
+    design = render_pdf_page(
+        pdf_bytes=pdf_bytes,
+        alpha=False
+    )
+
+    # Ajustar proporcionalmente
+    # dentro del cuadro interior
+    design = fit_inside(
+        design,
+        inner_width,
+        inner_height
+    )
+
+    # Crear únicamente el Display final.
+    # No copiamos la plantilla:
+    # no salen líneas verdes ni guías.
+    canvas = Image.new(
+        "RGBA",
+        (
+            display_width,
+            display_height
+        ),
+        (
+            255,
+            255,
+            255,
+            255
+        )
+    )
+
+    # Convertir coordenadas del área interior
+    # desde la plantilla al nuevo canvas.
+    relative_inner_left = (
+        inner_left
+        - outer_left
+    )
+
+    relative_inner_top = (
+        inner_top
+        - outer_top
+    )
+
+    relative_inner_right = (
+        inner_right
+        - outer_left
+    )
+
+    relative_inner_bottom = (
+        inner_bottom
+        - outer_top
+    )
+
+    relative_inner_width = (
+        relative_inner_right
+        - relative_inner_left
+    )
+
+    relative_inner_height = (
+        relative_inner_bottom
+        - relative_inner_top
+    )
+
+    # Centrar diseño dentro del cuadro interior
+    x = (
+        relative_inner_left
+        + (
+            relative_inner_width
+            - design.width
+        ) // 2
+    )
+
+    y = (
+        relative_inner_top
+        + (
+            relative_inner_height
+            - design.height
+        ) // 2
+    )
+
+    canvas.alpha_composite(
+        design.convert(
+            "RGBA"
+        ),
+        (
+            x,
+            y
+        )
+    )
+
+    # Aplicar marca de agua oficial
+    # sobre todo el Display final
+    apply_watermark(
+        canvas
+    )
+
+    # Exportar únicamente PNG
+    output = io.BytesIO()
+
+    canvas.convert(
+        "RGB"
+    ).save(
+        output,
+        format="PNG",
+        optimize=True
+    )
+
+    output.seek(
+        0
+    )
+
+    return output.getvalue()
+
+
 @app.post(
     "/process",
     response_class=Response
@@ -548,6 +746,13 @@ def apply_watermark(canvas):
 async def process_design(
     request: DriveRequest
 ):
+    """
+    Endpoint original.
+
+    Devuelve directamente el PNG binario.
+    Se conserva para Swagger y uso directo.
+    """
+
     try:
         # Descargar PDF desde Google Drive
         pdf_bytes = (
@@ -556,168 +761,13 @@ async def process_design(
             )
         )
 
-        # Renderizar plantilla oficial
-        template = render_pdf_page(
-            pdf_path=TEMPLATE_PATH,
-            alpha=False
-        )
-
-        # Detectar:
-        # - cuadro exterior = Display final
-        # - cuadro interior = área máxima del diseño
-        outer_rect, inner_rect = (
-            detect_rectangles(
-                template
-            )
-        )
-
-        (
-            outer_left,
-            outer_top,
-            outer_right,
-            outer_bottom
-        ) = outer_rect
-
-        (
-            inner_left,
-            inner_top,
-            inner_right,
-            inner_bottom
-        ) = inner_rect
-
-        display_width = (
-            outer_right
-            - outer_left
-        )
-
-        display_height = (
-            outer_bottom
-            - outer_top
-        )
-
-        inner_width = (
-            inner_right
-            - inner_left
-        )
-
-        inner_height = (
-            inner_bottom
-            - inner_top
-        )
-
-        # Renderizar diseño descargado
-        design = render_pdf_page(
-            pdf_bytes=pdf_bytes,
-            alpha=False
-        )
-
-        # Ajustar proporcionalmente
-        # dentro del cuadro interior
-        design = fit_inside(
-            design,
-            inner_width,
-            inner_height
-        )
-
-        # Crear únicamente el Display final.
-        # No copiamos la plantilla:
-        # no salen líneas verdes ni guías.
-        canvas = Image.new(
-            "RGBA",
-            (
-                display_width,
-                display_height
-            ),
-            (
-                255,
-                255,
-                255,
-                255
-            )
-        )
-
-        # Convertir coordenadas del área interior
-        # desde la plantilla al nuevo canvas.
-        relative_inner_left = (
-            inner_left
-            - outer_left
-        )
-
-        relative_inner_top = (
-            inner_top
-            - outer_top
-        )
-
-        relative_inner_right = (
-            inner_right
-            - outer_left
-        )
-
-        relative_inner_bottom = (
-            inner_bottom
-            - outer_top
-        )
-
-        relative_inner_width = (
-            relative_inner_right
-            - relative_inner_left
-        )
-
-        relative_inner_height = (
-            relative_inner_bottom
-            - relative_inner_top
-        )
-
-        # Centrar diseño dentro del cuadro interior
-        x = (
-            relative_inner_left
-            + (
-                relative_inner_width
-                - design.width
-            ) // 2
-        )
-
-        y = (
-            relative_inner_top
-            + (
-                relative_inner_height
-                - design.height
-            ) // 2
-        )
-
-        canvas.alpha_composite(
-            design.convert(
-                "RGBA"
-            ),
-            (
-                x,
-                y
-            )
-        )
-
-        # Aplicar marca de agua oficial
-        # sobre todo el Display final
-        apply_watermark(
-            canvas
-        )
-
-        # Exportar únicamente PNG
-        output = io.BytesIO()
-
-        canvas.convert(
-            "RGB"
-        ).save(
-            output,
-            format="PNG",
-            optimize=True
-        )
-
-        output.seek(
-            0
+        # Generar PNG final
+        png_bytes = generate_processed_png(
+            pdf_bytes
         )
 
         return Response(
-            content=output.getvalue(),
+            content=png_bytes,
             media_type="image/png",
             headers={
                 "Content-Disposition":
@@ -742,3 +792,115 @@ async def process_design(
             status_code=500,
             detail=str(e)
         )
+
+
+@app.post("/process-gpt")
+async def process_design_gpt(
+    request: DriveRequest
+):
+    """
+    Endpoint especial para GPT Actions.
+
+    Procesa exactamente igual que /process,
+    pero en lugar de devolver el PNG binario,
+    guarda temporalmente el archivo y devuelve
+    un JSON con una URL de descarga.
+    """
+
+    try:
+        # Descargar PDF desde Google Drive
+        pdf_bytes = (
+            await download_pdf_from_drive(
+                request.drive_url
+            )
+        )
+
+        # Generar PNG final
+        png_bytes = generate_processed_png(
+            pdf_bytes
+        )
+
+        # Crear identificador único
+        file_id = uuid4().hex
+
+        output_path = (
+            OUTPUT_DIR
+            / f"{file_id}.png"
+        )
+
+        # Guardar PNG temporalmente
+        output_path.write_bytes(
+            png_bytes
+        )
+
+        download_url = (
+            f"{PUBLIC_BASE_URL}"
+            f"/download/{file_id}"
+        )
+
+        return {
+            "success": True,
+            "file_id": file_id,
+            "filename": "diseno_procesado.png",
+            "content_type": "image/png",
+            "download_url": download_url
+        }
+
+    except HTTPException:
+        raise
+
+    except pymupdf.FileDataError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "El archivo descargado "
+                "no pudo abrirse como PDF."
+            )
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+@app.get("/download/{file_id}")
+def download_processed_design(
+    file_id: str
+):
+    """
+    Descarga un PNG generado previamente
+    mediante /process-gpt.
+    """
+
+    # uuid4().hex tiene exactamente
+    # 32 caracteres hexadecimales.
+    if not re.fullmatch(
+        r"[a-f0-9]{32}",
+        file_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="ID de archivo inválido."
+        )
+
+    output_path = (
+        OUTPUT_DIR
+        / f"{file_id}.png"
+    )
+
+    if not output_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "El archivo no existe o "
+                "ya no está disponible."
+            )
+        )
+
+    return FileResponse(
+        path=str(output_path),
+        media_type="image/png",
+        filename="diseno_procesado.png"
+    )
