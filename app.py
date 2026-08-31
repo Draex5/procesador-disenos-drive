@@ -1,995 +1,572 @@
-# Desarrollado por Diego Damas + ChatGPT
-
 import io
-import re
 import os
-
+import re
+import uuid
 from pathlib import Path
-from uuid import uuid4
+from typing import Optional
 
-import pymupdf
+import fitz  # PyMuPDF
 import httpx
-
-from PIL import Image
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response, FileResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, Response
+from PIL import Image
+from pydantic import BaseModel, Field
 
 
-app = FastAPI(
-    title="Procesador de Diseños",
-    version="1.6.0"
-)
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+APP_VERSION = "1.8.0"
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# Ajusta estos nombres si tus archivos se llaman diferente en Render
+TEMPLATE_PATH = BASE_DIR / "plantilla.pdf"
+WATERMARK_PATH = BASE_DIR / "marca_agua.pdf"
+
+# Si en tu proyecto real los archivos tienen estos nombres:
+if not TEMPLATE_PATH.exists():
+    alt_template = BASE_DIR / "Medidas para Exportar Diseños Drive.pdf"
+    if alt_template.exists():
+        TEMPLATE_PATH = alt_template
+
+if not WATERMARK_PATH.exists():
+    alt_watermark = BASE_DIR / "Marca de Agua.pdf"
+    if alt_watermark.exists():
+        WATERMARK_PATH = alt_watermark
 
 
-TEMPLATE_PATH = "plantilla.pdf"
-WATERMARK_PATH = "marca_agua.pdf"
+OUTPUT_DIR = Path("/tmp/processed_designs")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Calidad final
 OUTPUT_DPI = 300
-
-# Protección para la memoria de Render
 MAX_LONG_SIDE = 12000
 
-# Opacidad de la marca de agua
+# 0 = invisible, 255 = completamente opaca
 WATERMARK_OPACITY = 100
-
-
-# =========================================================
-# CONFIGURACIÓN RENDER / MAKE
-# =========================================================
-
-OUTPUT_DIR = Path(
-    "/tmp/disenos_procesados"
-)
-
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
 
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
     "https://procesador-disenos-drive.onrender.com"
 ).rstrip("/")
 
+MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL", "").strip()
 
-# Webhook de Make.
-#
-# RECOMENDADO:
-# Configurarlo en Render como variable de entorno:
-#
-# MAKE_WEBHOOK_URL
-#
-MAKE_WEBHOOK_URL = os.getenv(
-    "MAKE_WEBHOOK_URL",
-    ""
-).strip()
 
+# ============================================================
+# FASTAPI
+# ============================================================
+
+app = FastAPI(
+    title="Procesador de Diseños Drive",
+    version=APP_VERSION
+)
+
+
+# ============================================================
+# MODELOS
+# ============================================================
 
 class DriveRequest(BaseModel):
     drive_url: str
 
 
-@app.get("/")
-def inicio():
-    return {
-        "status": "ok",
-        "message": (
-            "API de procesamiento "
-            "de diseños funcionando"
-        ),
-        "version": "1.6.0",
-        "make_configured": bool(
-            MAKE_WEBHOOK_URL
-        )
-    }
+class GPTDriveRequest(BaseModel):
+    drive_url: str
+    initials: str = Field(..., min_length=1, max_length=10)
+    description: str = Field(..., min_length=1, max_length=180)
 
 
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy",
-        "make_configured": bool(
-            MAKE_WEBHOOK_URL
-        )
-    }
+# ============================================================
+# UTILIDADES DE TEXTO / NOMBRE
+# ============================================================
 
-
-# =========================================================
-# GOOGLE DRIVE - DESCARGA DEL PDF ORIGINAL
-# =========================================================
-
-def get_google_drive_file_id(url):
+def sanitize_initials(value: str) -> str:
     """
-    Extrae el ID de un archivo desde distintos
-    formatos de enlaces de Google Drive.
+    Limpia las iniciales.
+    Ej:
+        ' dd ' -> 'DD'
+        'D.D.' -> 'DD'
     """
+    value = value.strip().upper()
 
+    # Dejamos únicamente letras y números
+    value = re.sub(r"[^A-Z0-9ÁÉÍÓÚÜÑ]", "", value)
+
+    if not value:
+        raise ValueError("Las iniciales no son válidas.")
+
+    return value[:10]
+
+
+def sanitize_description(value: str) -> str:
+    """
+    Limpia la descripción para que pueda formar parte del nombre de archivo.
+    Conserva espacios, acentos, guiones y texto normal.
+    """
+    value = value.strip()
+
+    # Caracteres prohibidos en nombres de archivo
+    value = re.sub(r'[\\/:*?"<>|]', "-", value)
+
+    # Espacios repetidos
+    value = re.sub(r"\s+", " ", value)
+
+    # Evita puntos o espacios al final
+    value = value.strip(" .")
+
+    if not value:
+        raise ValueError("La descripción no es válida.")
+
+    return value[:180]
+
+
+# ============================================================
+# GOOGLE DRIVE
+# ============================================================
+
+def extract_drive_file_id(url: str) -> str:
     patterns = [
         r"/file/d/([a-zA-Z0-9_-]+)",
-        r"[?&]id=([a-zA-Z0-9_-]+)"
+        r"[?&]id=([a-zA-Z0-9_-]+)",
+        r"/d/([a-zA-Z0-9_-]+)",
     ]
 
     for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            url
-        )
-
+        match = re.search(pattern, url)
         if match:
             return match.group(1)
 
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            "No pude obtener el ID del archivo "
-            "de Google Drive."
-        )
-    )
+    raise ValueError("No se pudo obtener el ID del archivo de Google Drive.")
 
 
-async def download_pdf_from_drive(
-    drive_url
-):
-    """
-    Descarga un PDF público desde Google Drive.
-    """
-
-    file_id = get_google_drive_file_id(
-        drive_url
-    )
+async def download_drive_pdf(drive_url: str) -> bytes:
+    file_id = extract_drive_file_id(drive_url)
 
     download_url = (
-        "https://drive.usercontent.google.com/"
-        f"download?id={file_id}"
-        "&export=download"
-        "&confirm=t"
+        f"https://drive.usercontent.google.com/download"
+        f"?id={file_id}&export=download&confirm=t"
     )
 
-    try:
-
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=60.0
-        ) as client:
-
-            response = await client.get(
-                download_url
-            )
-
-    except httpx.RequestError as e:
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "No pude conectar con Google Drive: "
-                f"{str(e)}"
-            )
-        )
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=120.0
+    ) as client:
+        response = await client.get(download_url)
 
     if response.status_code != 200:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No se pudo descargar el PDF de Google Drive. "
+                   f"HTTP {response.status_code}"
+        )
 
+    content = response.content
+
+    if not content.startswith(b"%PDF"):
         raise HTTPException(
             status_code=400,
             detail=(
-                "Google Drive no permitió descargar "
-                f"el archivo. HTTP "
-                f"{response.status_code}"
+                "El archivo descargado no parece ser un PDF válido. "
+                "Verifica que el archivo de Drive tenga acceso mediante enlace."
             )
         )
 
-    pdf_bytes = response.content
-
-    if not pdf_bytes:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Google Drive devolvió "
-                "un archivo vacío."
-            )
-        )
-
-    if not pdf_bytes.startswith(
-        b"%PDF"
-    ):
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "El enlace de Google Drive "
-                "no devolvió un PDF. "
-                "Comprueba que el archivo esté "
-                "compartido como "
-                "'Cualquier persona con el enlace'."
-            )
-        )
-
-    return pdf_bytes
+    return content
 
 
-# =========================================================
-# RENDERIZADO PDF
-# =========================================================
+# ============================================================
+# PDF / IMAGEN
+# ============================================================
 
 def render_pdf_page(
-    pdf_bytes=None,
-    pdf_path=None,
-    alpha=False,
-    dpi=OUTPUT_DPI,
-    target_width=None,
-    target_height=None
-):
-    """
-    Renderiza la primera página de un PDF.
+    pdf_source,
+    page_number: int = 0,
+    dpi: Optional[int] = None,
+    target_width: Optional[int] = None,
+    target_height: Optional[int] = None,
+) -> Image.Image:
 
-    Si se proporcionan target_width y target_height,
-    rasteriza directamente desde el PDF al tamaño
-    final requerido.
-    """
-
-    if pdf_bytes is not None:
-
-        doc = pymupdf.open(
-            stream=pdf_bytes,
-            filetype="pdf"
-        )
-
-    elif pdf_path is not None:
-
-        doc = pymupdf.open(
-            pdf_path
-        )
-
+    if isinstance(pdf_source, (str, Path)):
+        doc = fitz.open(str(pdf_source))
     else:
-
-        raise ValueError(
-            "Debe proporcionarse "
-            "pdf_bytes o pdf_path."
-        )
+        doc = fitz.open(stream=pdf_source, filetype="pdf")
 
     try:
+        page = doc[page_number]
 
-        if len(doc) == 0:
+        if target_width and target_height:
+            rect = page.rect
 
-            raise ValueError(
-                "El PDF no contiene páginas."
-            )
+            scale_x = target_width / rect.width
+            scale_y = target_height / rect.height
 
-        page = doc[0]
-
-        page_width = page.rect.width
-        page_height = page.rect.height
-
-        if (
-            page_width <= 0
-            or page_height <= 0
-        ):
-
-            raise ValueError(
-                "La página PDF tiene "
-                "dimensiones inválidas."
-            )
-
-        if (
-            target_width is not None
-            and target_height is not None
-        ):
-
-            scale = min(
-                target_width / page_width,
-                target_height / page_height
-            )
-
-            scale = max(
-                scale,
-                0.01
-            )
-
-            matrix = pymupdf.Matrix(
-                scale,
-                scale
-            )
-
-            pix = page.get_pixmap(
-                matrix=matrix,
-                alpha=alpha
-            )
+            matrix = fitz.Matrix(scale_x, scale_y)
 
         else:
+            render_dpi = dpi or OUTPUT_DPI
+            scale = render_dpi / 72.0
+            matrix = fitz.Matrix(scale, scale)
 
-            pix = page.get_pixmap(
-                dpi=dpi,
-                alpha=alpha
-            )
-
-        mode = (
-            "RGBA"
-            if alpha
-            else "RGB"
+        pix = page.get_pixmap(
+            matrix=matrix,
+            alpha=True
         )
 
         image = Image.frombytes(
-            mode,
-            (
-                pix.width,
-                pix.height
-            ),
+            "RGBA",
+            [pix.width, pix.height],
             pix.samples
         )
 
         return image
 
     finally:
-
         doc.close()
 
 
-# =========================================================
-# CONTROL DE RESOLUCIÓN
-# =========================================================
+def limit_dimensions(width: int, height: int):
+    longest = max(width, height)
 
-def limit_dimensions(
-    width,
-    height,
-    max_long_side=MAX_LONG_SIDE
-):
-    """
-    Limita las dimensiones máximas
-    manteniendo proporción.
-    """
+    if longest <= MAX_LONG_SIDE:
+        return width, height
 
-    width = int(width)
-    height = int(height)
-
-    longest = max(
-        width,
-        height
-    )
-
-    if longest <= max_long_side:
-
-        return (
-            width,
-            height,
-            1.0
-        )
-
-    scale = (
-        max_long_side
-        / longest
-    )
-
-    new_width = max(
-        1,
-        round(
-            width * scale
-        )
-    )
-
-    new_height = max(
-        1,
-        round(
-            height * scale
-        )
-    )
+    factor = MAX_LONG_SIDE / longest
 
     return (
-        new_width,
-        new_height,
-        scale
+        max(1, round(width * factor)),
+        max(1, round(height * factor))
     )
 
 
-# =========================================================
-# DETECCIÓN DE PLANTILLA
-# =========================================================
-
-def is_green(pixel):
+def is_green_pixel(r: int, g: int, b: int) -> bool:
     """
-    Detecta aproximadamente las líneas verdes
-    de la plantilla oficial.
+    Detecta aproximadamente las líneas verdes de la plantilla.
     """
-
-    r, g, b = pixel[:3]
-
     return (
-        g > 80
-        and g > r * 1.25
+        g > 100
+        and g > r * 1.15
         and g > b * 1.15
     )
 
 
-def group_positions(
-    values,
-    tolerance=8
-):
+def detect_green_rectangles(template: Image.Image):
     """
-    Agrupa posiciones consecutivas
-    correspondientes a una misma línea.
+    Detecta los dos rectángulos verdes:
+    - exterior = Display final
+    - interior = área máxima del diseño
     """
 
-    if not values:
-        return []
+    img = template.convert("RGB")
+    width, height = img.size
 
-    groups = [
-        [values[0]]
-    ]
+    xs = []
+    ys = []
 
-    for value in values[1:]:
+    for y in range(height):
+        for x in range(width):
+            r, g, b = img.getpixel((x, y))
 
-        if (
-            value
-            - groups[-1][-1]
-            <= tolerance
-        ):
+            if is_green_pixel(r, g, b):
+                xs.append(x)
+                ys.append(y)
 
-            groups[-1].append(
-                value
-            )
-
-        else:
-
-            groups.append(
-                [value]
-            )
-
-    return [
-        int(
-            sum(group)
-            / len(group)
+    if not xs or not ys:
+        raise RuntimeError(
+            "No se pudieron detectar las líneas verdes de la plantilla."
         )
-        for group
-        in groups
-    ]
 
+    min_x = min(xs)
+    max_x = max(xs)
+    min_y = min(ys)
+    max_y = max(ys)
 
-def detect_rectangles(
-    template
-):
-    """
-    Detecta:
+    # Para encontrar el rectángulo interior, descartamos una zona próxima
+    # al borde del rectángulo exterior.
+    margin_x = max(5, int(width * 0.03))
+    margin_y = max(5, int(height * 0.03))
 
-    outer_rect:
-        Display final.
+    inner_xs = []
+    inner_ys = []
 
-    inner_rect:
-        Área máxima del diseño.
-    """
-
-    rgb = template.convert(
-        "RGB"
-    )
-
-    width, height = rgb.size
-
-    vertical_scores = [
-        0
-    ] * width
-
-    horizontal_scores = [
-        0
-    ] * height
-
-    pixels = rgb.load()
-
-    step = 2
-
-    for y in range(
-        0,
-        height,
-        step
-    ):
-
-        for x in range(
-            0,
-            width,
-            step
-        ):
-
-            if is_green(
-                pixels[x, y]
+    for y in range(height):
+        for x in range(width):
+            if (
+                x <= min_x + margin_x
+                or x >= max_x - margin_x
+                or y <= min_y + margin_y
+                or y >= max_y - margin_y
             ):
+                continue
 
-                vertical_scores[x] += 1
-                horizontal_scores[y] += 1
+            r, g, b = img.getpixel((x, y))
 
-    vertical_candidates = [
-        i
-        for i, score
-        in enumerate(
-            vertical_scores
-        )
-        if (
-            score
-            > height
-            * 0.08
-            / step
-        )
-    ]
+            if is_green_pixel(r, g, b):
+                inner_xs.append(x)
+                inner_ys.append(y)
 
-    horizontal_candidates = [
-        i
-        for i, score
-        in enumerate(
-            horizontal_scores
-        )
-        if (
-            score
-            > width
-            * 0.08
-            / step
-        )
-    ]
-
-    xs = group_positions(
-        vertical_candidates
-    )
-
-    ys = group_positions(
-        horizontal_candidates
-    )
-
-    if (
-        len(xs) < 4
-        or len(ys) < 4
-    ):
-
-        raise ValueError(
-            "No pude detectar correctamente "
-            "los cuadros verdes "
-            "de la plantilla."
-        )
-
-    xs = sorted(
-        xs
-    )
-
-    ys = sorted(
-        ys
-    )
-
-    outer_left = xs[0]
-    outer_right = xs[-1]
-
-    outer_top = ys[0]
-    outer_bottom = ys[-1]
-
-    inner_left = xs[1]
-    inner_right = xs[-2]
-
-    inner_top = ys[1]
-    inner_bottom = ys[-2]
-
-    if (
-        outer_right <= outer_left
-        or outer_bottom <= outer_top
-    ):
-
-        raise ValueError(
-            "El cuadro exterior detectado "
-            "no es válido."
-        )
-
-    if (
-        inner_right <= inner_left
-        or inner_bottom <= inner_top
-    ):
-
-        raise ValueError(
-            "El cuadro interior detectado "
-            "no es válido."
+    if not inner_xs or not inner_ys:
+        raise RuntimeError(
+            "Se detectó el rectángulo exterior, "
+            "pero no el área interior de diseño."
         )
 
     outer_rect = (
-        outer_left,
-        outer_top,
-        outer_right,
-        outer_bottom
+        min_x,
+        min_y,
+        max_x + 1,
+        max_y + 1
     )
 
     inner_rect = (
-        inner_left,
-        inner_top,
-        inner_right,
-        inner_bottom
+        min(inner_xs),
+        min(inner_ys),
+        max(inner_xs) + 1,
+        max(inner_ys) + 1
+    )
+
+    return outer_rect, inner_rect
+
+
+def fit_inside(
+    source_width: int,
+    source_height: int,
+    max_width: int,
+    max_height: int
+):
+    """
+    Ajusta conservando siempre la proporción original.
+    """
+    scale = min(
+        max_width / source_width,
+        max_height / source_height
     )
 
     return (
-        outer_rect,
-        inner_rect
+        max(1, round(source_width * scale)),
+        max(1, round(source_height * scale))
     )
-
-
-# =========================================================
-# AJUSTE DEL DISEÑO
-# =========================================================
-
-def fit_inside(
-    image,
-    max_width,
-    max_height
-):
-    """
-    Ajusta la imagen al área máxima
-    sin recortar ni deformar.
-    """
-
-    width, height = image.size
-
-    if (
-        width <= 0
-        or height <= 0
-    ):
-
-        raise ValueError(
-            "El diseño tiene "
-            "dimensiones inválidas."
-        )
-
-    scale = min(
-        max_width / width,
-        max_height / height
-    )
-
-    new_width = max(
-        1,
-        round(
-            width * scale
-        )
-    )
-
-    new_height = max(
-        1,
-        round(
-            height * scale
-        )
-    )
-
-    return image.resize(
-        (
-            new_width,
-            new_height
-        ),
-        Image.Resampling.LANCZOS
-    )
-
-
-# =========================================================
-# MARCA DE AGUA
-# =========================================================
-
-def make_white_transparent(
-    image,
-    opacity=100
-):
-    """
-    Convierte el blanco en transparente
-    y aplica opacidad a la marca.
-    """
-
-    image = image.convert(
-        "RGBA"
-    )
-
-    pixels = image.load()
-
-    for y in range(
-        image.height
-    ):
-
-        for x in range(
-            image.width
-        ):
-
-            r, g, b, a = pixels[x, y]
-
-            if (
-                r > 245
-                and g > 245
-                and b > 245
-            ):
-
-                pixels[x, y] = (
-                    255,
-                    255,
-                    255,
-                    0
-                )
-
-            else:
-
-                pixels[x, y] = (
-                    r,
-                    g,
-                    b,
-                    opacity
-                )
-
-    return image
 
 
 def apply_watermark(
-    canvas
-):
-    """
-    Aplica la marca oficial
-    sobre todo el Display.
-    """
+    base_image: Image.Image,
+    watermark_path: Path
+) -> Image.Image:
+
+    width, height = base_image.size
 
     watermark = render_pdf_page(
-        pdf_path=WATERMARK_PATH,
-        alpha=False,
-        target_width=canvas.width,
-        target_height=canvas.height
+        watermark_path,
+        target_width=width,
+        target_height=height
+    ).convert("RGBA")
+
+    # Ajustamos opacidad global sin perder el alfa original
+    alpha = watermark.getchannel("A")
+
+    alpha = alpha.point(
+        lambda p: int(p * (WATERMARK_OPACITY / 255.0))
     )
 
-    if watermark.size != canvas.size:
+    watermark.putalpha(alpha)
 
-        watermark = watermark.resize(
-            canvas.size,
-            Image.Resampling.LANCZOS
+    return Image.alpha_composite(
+        base_image.convert("RGBA"),
+        watermark
+    )
+
+
+# ============================================================
+# PROCESAMIENTO PRINCIPAL
+# ============================================================
+
+def process_pdf(pdf_bytes: bytes) -> bytes:
+
+    if not TEMPLATE_PATH.exists():
+        raise RuntimeError(
+            f"No existe la plantilla: {TEMPLATE_PATH}"
         )
 
-    watermark = make_white_transparent(
-        watermark,
-        opacity=WATERMARK_OPACITY
-    )
-
-    canvas.alpha_composite(
-        watermark,
-        (
-            0,
-            0
-        )
-    )
-
-
-# =========================================================
-# GENERACIÓN DEL PNG
-# =========================================================
-
-def generate_processed_png(
-    pdf_bytes
-):
-    """
-    Genera el PNG final.
-    """
-
-    template = render_pdf_page(
-        pdf_path=TEMPLATE_PATH,
-        alpha=False,
-        dpi=OUTPUT_DPI
-    )
-
-    outer_rect, inner_rect = (
-        detect_rectangles(
-            template
-        )
-    )
-
-    (
-        outer_left,
-        outer_top,
-        outer_right,
-        outer_bottom
-    ) = outer_rect
-
-    (
-        inner_left,
-        inner_top,
-        inner_right,
-        inner_bottom
-    ) = inner_rect
-
-    original_display_width = (
-        outer_right
-        - outer_left
-    )
-
-    original_display_height = (
-        outer_bottom
-        - outer_top
-    )
-
-    (
-        display_width,
-        display_height,
-        output_scale
-    ) = limit_dimensions(
-        original_display_width,
-        original_display_height
-    )
-
-    outer_left_scaled = (
-        outer_left
-        * output_scale
-    )
-
-    outer_top_scaled = (
-        outer_top
-        * output_scale
-    )
-
-    inner_left_scaled = (
-        inner_left
-        * output_scale
-    )
-
-    inner_top_scaled = (
-        inner_top
-        * output_scale
-    )
-
-    inner_right_scaled = (
-        inner_right
-        * output_scale
-    )
-
-    inner_bottom_scaled = (
-        inner_bottom
-        * output_scale
-    )
-
-    relative_inner_left = round(
-        inner_left_scaled
-        - outer_left_scaled
-    )
-
-    relative_inner_top = round(
-        inner_top_scaled
-        - outer_top_scaled
-    )
-
-    relative_inner_right = round(
-        inner_right_scaled
-        - outer_left_scaled
-    )
-
-    relative_inner_bottom = round(
-        inner_bottom_scaled
-        - outer_top_scaled
-    )
-
-    relative_inner_width = (
-        relative_inner_right
-        - relative_inner_left
-    )
-
-    relative_inner_height = (
-        relative_inner_bottom
-        - relative_inner_top
-    )
-
-    if (
-        relative_inner_width <= 0
-        or relative_inner_height <= 0
-    ):
-
-        raise ValueError(
-            "El área interior calculada "
-            "no es válida."
+    if not WATERMARK_PATH.exists():
+        raise RuntimeError(
+            f"No existe la marca de agua: {WATERMARK_PATH}"
         )
 
-    design = render_pdf_page(
-        pdf_bytes=pdf_bytes,
-        alpha=False,
-        target_width=relative_inner_width,
-        target_height=relative_inner_height
+    # --------------------------------------------------------
+    # 1. Renderizamos plantilla para detectar dimensiones
+    # --------------------------------------------------------
+
+    template_preview = render_pdf_page(
+        TEMPLATE_PATH,
+        dpi=150
     )
 
-    if (
-        design.width > relative_inner_width
-        or design.height > relative_inner_height
-    ):
+    outer_rect, inner_rect = detect_green_rectangles(
+        template_preview
+    )
 
-        design = fit_inside(
-            design,
-            relative_inner_width,
-            relative_inner_height
-        )
+    preview_width, preview_height = template_preview.size
+
+    outer_left, outer_top, outer_right, outer_bottom = outer_rect
+    inner_left, inner_top, inner_right, inner_bottom = inner_rect
+
+    outer_width_preview = outer_right - outer_left
+    outer_height_preview = outer_bottom - outer_top
+
+    # --------------------------------------------------------
+    # 2. Calculamos tamaño final a 300 DPI
+    # --------------------------------------------------------
+
+    scale_factor = OUTPUT_DPI / 150.0
+
+    final_width = round(
+        outer_width_preview * scale_factor
+    )
+
+    final_height = round(
+        outer_height_preview * scale_factor
+    )
+
+    final_width, final_height = limit_dimensions(
+        final_width,
+        final_height
+    )
+
+    # Escala real luego del límite de tamaño
+    scale_x = final_width / outer_width_preview
+    scale_y = final_height / outer_height_preview
+
+    inner_left_final = round(
+        (inner_left - outer_left) * scale_x
+    )
+
+    inner_top_final = round(
+        (inner_top - outer_top) * scale_y
+    )
+
+    inner_right_final = round(
+        (inner_right - outer_left) * scale_x
+    )
+
+    inner_bottom_final = round(
+        (inner_bottom - outer_top) * scale_y
+    )
+
+    inner_width_final = (
+        inner_right_final - inner_left_final
+    )
+
+    inner_height_final = (
+        inner_bottom_final - inner_top_final
+    )
+
+    # --------------------------------------------------------
+    # 3. Obtenemos proporción ORIGINAL del PDF del cliente
+    # --------------------------------------------------------
+
+    design_doc = fitz.open(
+        stream=pdf_bytes,
+        filetype="pdf"
+    )
+
+    try:
+        if design_doc.page_count < 1:
+            raise RuntimeError(
+                "El PDF del diseño no contiene páginas."
+            )
+
+        design_page = design_doc[0]
+
+        source_width = design_page.rect.width
+        source_height = design_page.rect.height
+
+    finally:
+        design_doc.close()
+
+    target_width, target_height = fit_inside(
+        source_width,
+        source_height,
+        inner_width_final,
+        inner_height_final
+    )
+
+    # --------------------------------------------------------
+    # 4. Render directo desde PDF al tamaño requerido
+    # --------------------------------------------------------
+
+    design_image = render_pdf_page(
+        pdf_bytes,
+        target_width=target_width,
+        target_height=target_height
+    ).convert("RGBA")
+
+    # --------------------------------------------------------
+    # 5. Canvas blanco = Display final
+    # --------------------------------------------------------
 
     canvas = Image.new(
         "RGBA",
-        (
-            display_width,
-            display_height
-        ),
-        (
-            255,
-            255,
-            255,
-            255
-        )
+        (final_width, final_height),
+        (255, 255, 255, 255)
     )
 
-    x = (
-        relative_inner_left
-        + (
-            relative_inner_width
-            - design.width
-        ) // 2
+    design_x = (
+        inner_left_final
+        + (inner_width_final - target_width) // 2
     )
 
-    y = (
-        relative_inner_top
-        + (
-            relative_inner_height
-            - design.height
-        ) // 2
+    design_y = (
+        inner_top_final
+        + (inner_height_final - target_height) // 2
     )
 
     canvas.alpha_composite(
-        design.convert(
-            "RGBA"
-        ),
-        (
-            x,
-            y
-        )
+        design_image,
+        (design_x, design_y)
     )
 
-    apply_watermark(
-        canvas
+    # --------------------------------------------------------
+    # 6. Marca de agua
+    # --------------------------------------------------------
+
+    canvas = apply_watermark(
+        canvas,
+        WATERMARK_PATH
     )
+
+    # --------------------------------------------------------
+    # 7. PNG
+    # --------------------------------------------------------
 
     output = io.BytesIO()
 
-    final_image = canvas.convert(
-        "RGB"
-    )
-
-    final_image.save(
+    canvas.convert("RGB").save(
         output,
         format="PNG",
         optimize=True,
         compress_level=6,
-        dpi=(
-            OUTPUT_DPI,
-            OUTPUT_DPI
-        )
-    )
-
-    output.seek(
-        0
+        dpi=(OUTPUT_DPI, OUTPUT_DPI)
     )
 
     return output.getvalue()
 
 
-# =========================================================
-# MAKE.COM
-# =========================================================
+# ============================================================
+# MAKE
+# ============================================================
 
 async def send_png_to_make(
-    png_bytes,
-    filename,
-    source_drive_url=""
+    png_bytes: bytes,
+    filename: str,
+    source_drive_url: str,
+    initials: str,
+    description: str
 ):
-    """
-    Envía el PNG generado a Make mediante
-    multipart/form-data.
-
-    Make recibirá:
-        file
-        filename
-        content_type
-        source_drive_url
-
-    El campo "file" es el PNG real.
-    """
-
     if not MAKE_WEBHOOK_URL:
-
         raise HTTPException(
             status_code=500,
-            detail=(
-                "MAKE_WEBHOOK_URL no está configurado "
-                "en las variables de entorno de Render."
-            )
+            detail="MAKE_WEBHOOK_URL no está configurada en Render."
         )
 
     files = {
@@ -1003,305 +580,273 @@ async def send_png_to_make(
     data = {
         "filename": filename,
         "content_type": "image/png",
-        "source_drive_url": source_drive_url
+        "source_drive_url": source_drive_url,
+
+        # NUEVOS CAMPOS
+        "initials": initials,
+        "description": description,
     }
 
     try:
-
         async with httpx.AsyncClient(
-            follow_redirects=True,
             timeout=120.0
         ) as client:
 
             response = await client.post(
                 MAKE_WEBHOOK_URL,
-                data=data,
-                files=files
+                files=files,
+                data=data
             )
 
-    except httpx.RequestError as e:
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"No se pudo conectar con Make: {exc}"
+        )
 
+    if response.status_code < 200 or response.status_code >= 300:
         raise HTTPException(
             status_code=502,
             detail=(
-                "No pude conectar con Make: "
-                f"{str(e)}"
+                f"Make rechazó el archivo. "
+                f"HTTP {response.status_code}: "
+                f"{response.text[:500]}"
             )
         )
 
-    if (
-        response.status_code < 200
-        or response.status_code >= 300
-    ):
+    return response.status_code
 
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Make rechazó el archivo. "
-                f"HTTP {response.status_code}. "
-                f"Respuesta: {response.text[:500]}"
-            )
-        )
 
+# ============================================================
+# ENDPOINTS
+# ============================================================
+
+@app.get("/")
+async def root():
     return {
         "success": True,
-        "status_code": response.status_code,
-        "response": response.text[:500]
+        "service": "Procesador de Diseños Drive",
+        "version": APP_VERSION
     }
 
 
-# =========================================================
-# PRUEBA DE CONEXIÓN CON MAKE
-# =========================================================
+@app.get("/health")
+async def health():
+    return {
+        "success": True,
+        "status": "ok",
+        "version": APP_VERSION
+    }
 
-@app.get("/test-make")
-async def test_make():
+
+@app.post("/process")
+async def process(request: DriveRequest):
     """
-    Prueba sencilla de comunicación
-    Render -> Make.
-
-    No envía un PNG real.
-    """
-
-    if not MAKE_WEBHOOK_URL:
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "MAKE_WEBHOOK_URL no está configurado."
-            )
-        )
-
-    try:
-
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=30.0
-        ) as client:
-
-            response = await client.post(
-                MAKE_WEBHOOK_URL,
-                data={
-                    "test": "true",
-                    "message": (
-                        "Conexion Render -> Make funcionando"
-                    )
-                }
-            )
-
-        return {
-            "success": True,
-            "make_status": response.status_code,
-            "make_response": response.text
-        }
-
-    except httpx.RequestError as e:
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "No pude conectar con Make: "
-                f"{str(e)}"
-            )
-        )
-
-
-# =========================================================
-# ENDPOINT /PROCESS
-# =========================================================
-
-@app.post(
-    "/process",
-    response_class=Response
-)
-async def process_design(
-    request: DriveRequest
-):
-    """
-    Procesa el PDF y devuelve
-    directamente el PNG.
+    Endpoint que devuelve directamente el PNG.
     """
 
     try:
-
-        pdf_bytes = (
-            await download_pdf_from_drive(
-                request.drive_url
-            )
+        pdf_bytes = await download_drive_pdf(
+            request.drive_url
         )
 
-        png_bytes = generate_processed_png(
-            pdf_bytes
-        )
+        png_bytes = process_pdf(pdf_bytes)
 
         return Response(
             content=png_bytes,
             media_type="image/png",
             headers={
                 "Content-Disposition":
-                'attachment; filename="diseno_procesado.png"'
+                    'inline; filename="diseno_procesado.png"'
             }
         )
 
     except HTTPException:
         raise
 
-    except pymupdf.FileDataError:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "El archivo descargado "
-                "no pudo abrirse como PDF."
-            )
-        )
-
-    except Exception as e:
-
+    except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=str(e)
+            detail=str(exc)
         )
 
 
-# =========================================================
-# ENDPOINT /PROCESS-GPT
-# =========================================================
-
 @app.post("/process-gpt")
-async def process_design_gpt(
-    request: DriveRequest
-):
+async def process_gpt(request: GPTDriveRequest):
     """
-    Flujo principal para GPT.
+    Endpoint usado por el GPT.
 
-    1. Descarga PDF desde Drive.
-    2. Genera PNG.
-    3. Guarda temporalmente en Render.
-    4. Envía PNG real a Make.
-    5. Devuelve URL temporal + estado Make.
+    Recibe:
+        drive_url
+        initials
+        description
+
+    El consecutivo NO se genera aquí.
+    Make lo obtendrá desde Google Sheets.
     """
 
     try:
-
-        # Descargar PDF
-        pdf_bytes = (
-            await download_pdf_from_drive(
-                request.drive_url
-            )
+        initials = sanitize_initials(
+            request.initials
         )
 
-        # Generar PNG
-        png_bytes = generate_processed_png(
+        description = sanitize_description(
+            request.description
+        )
+
+        # ----------------------------------------------------
+        # Descargar PDF
+        # ----------------------------------------------------
+
+        pdf_bytes = await download_drive_pdf(
+            request.drive_url
+        )
+
+        # ----------------------------------------------------
+        # Procesar diseño
+        # ----------------------------------------------------
+
+        png_bytes = process_pdf(
             pdf_bytes
         )
 
-        # ID único
-        file_id = uuid4().hex
+        # ----------------------------------------------------
+        # Nombre TEMPORAL
+        #
+        # Make cambiará el nombre definitivo después de
+        # obtener el consecutivo de Google Sheets.
+        # ----------------------------------------------------
 
-        filename = (
-            f"diseno_procesado_{file_id[:8]}.png"
+        temp_id = uuid.uuid4().hex
+
+        temp_filename = (
+            f"diseno_temporal_{temp_id[:8]}.png"
         )
 
-        # Guardar copia temporal en Render
-        output_path = (
-            OUTPUT_DIR
-            / f"{file_id}.png"
+        temp_path = (
+            OUTPUT_DIR / f"{temp_id}.png"
         )
 
-        output_path.write_bytes(
+        temp_path.write_bytes(
             png_bytes
         )
 
         download_url = (
-            f"{PUBLIC_BASE_URL}"
-            f"/download/{file_id}"
+            f"{PUBLIC_BASE_URL}/download/{temp_id}"
         )
 
-        # Enviar PNG a Make
-        make_result = (
-            await send_png_to_make(
-                png_bytes=png_bytes,
-                filename=filename,
-                source_drive_url=request.drive_url
-            )
+        # ----------------------------------------------------
+        # Enviar a Make
+        # ----------------------------------------------------
+
+        make_status = await send_png_to_make(
+            png_bytes=png_bytes,
+            filename=temp_filename,
+            source_drive_url=request.drive_url,
+            initials=initials,
+            description=description
         )
 
         return {
             "success": True,
-            "file_id": file_id,
-            "filename": filename,
+
+            "file_id": temp_id,
+
+            # Este todavía NO es el nombre definitivo
+            "filename": temp_filename,
+
             "content_type": "image/png",
+
             "download_url": download_url,
+
+            "initials": initials,
+            "description": description,
+
             "make_sent": True,
-            "make_status": (
-                make_result[
-                    "status_code"
-                ]
+            "make_status": make_status,
+
+            "message": (
+                "PNG procesado y enviado a Make. "
+                "Make asignará el consecutivo y el nombre final."
             )
         }
 
     except HTTPException:
         raise
 
-    except pymupdf.FileDataError:
-
+    except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "El archivo descargado "
-                "no pudo abrirse como PDF."
-            )
+            detail=str(exc)
         )
 
-    except Exception as e:
-
+    except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=str(e)
+            detail=str(exc)
         )
 
 
-# =========================================================
-# DESCARGA TEMPORAL
-# =========================================================
-
 @app.get("/download/{file_id}")
-def download_processed_design(
-    file_id: str
-):
-    """
-    Descarga un PNG generado mediante
-    /process-gpt.
-    """
+async def download(file_id: str):
 
     if not re.fullmatch(
-        r"[a-f0-9]{32}",
+        r"[a-fA-F0-9]{32}",
         file_id
     ):
-
         raise HTTPException(
             status_code=400,
             detail="ID de archivo inválido."
         )
 
-    output_path = (
-        OUTPUT_DIR
-        / f"{file_id}.png"
-    )
+    path = OUTPUT_DIR / f"{file_id}.png"
 
-    if not output_path.exists():
-
+    if not path.exists():
         raise HTTPException(
             status_code=404,
-            detail=(
-                "El archivo no existe o "
-                "ya no está disponible."
-            )
+            detail="Archivo no encontrado."
         )
 
     return FileResponse(
-        path=str(output_path),
+        path,
         media_type="image/png",
         filename="diseno_procesado.png"
     )
+
+
+@app.get("/test-make")
+async def test_make():
+
+    if not MAKE_WEBHOOK_URL:
+        raise HTTPException(
+            status_code=500,
+            detail="MAKE_WEBHOOK_URL no configurada."
+        )
+
+    test_image = Image.new(
+        "RGB",
+        (500, 500),
+        "white"
+    )
+
+    output = io.BytesIO()
+
+    test_image.save(
+        output,
+        format="PNG"
+    )
+
+    png_bytes = output.getvalue()
+
+    status = await send_png_to_make(
+        png_bytes=png_bytes,
+        filename="prueba_make.png",
+        source_drive_url="TEST",
+        initials="DD",
+        description="Prueba Make"
+    )
+
+    return {
+        "success": True,
+        "make_status": status
+    }
