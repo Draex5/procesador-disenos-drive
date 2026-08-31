@@ -1,7 +1,7 @@
 import io
 import re
 
-import fitz
+import pymupdf
 import httpx
 
 from PIL import Image
@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="Procesador de Diseños",
-    version="1.3.0"
+    version="1.3.1"
 )
 
 TEMPLATE_PATH = "plantilla.pdf"
@@ -152,13 +152,13 @@ def render_pdf_page(
     """
 
     if pdf_bytes is not None:
-        doc = fitz.open(
+        doc = pymupdf.open(
             stream=pdf_bytes,
             filetype="pdf"
         )
 
     elif pdf_path is not None:
-        doc = fitz.open(
+        doc = pymupdf.open(
             pdf_path
         )
 
@@ -176,7 +176,7 @@ def render_pdf_page(
 
         page = doc[0]
 
-        matrix = fitz.Matrix(
+        matrix = pymupdf.Matrix(
             RENDER_SCALE,
             RENDER_SCALE
         )
@@ -527,11 +527,9 @@ def apply_watermark(canvas):
         Image.Resampling.LANCZOS
     )
 
-    watermark = (
-        make_white_transparent(
-            watermark,
-            opacity=WATERMARK_OPACITY
-        )
+    watermark = make_white_transparent(
+        watermark,
+        opacity=WATERMARK_OPACITY
     )
 
     canvas.alpha_composite(
@@ -730,7 +728,7 @@ async def process_design(
     except HTTPException:
         raise
 
-    except fitz.FileDataError:
+    except pymupdf.FileDataError:
         raise HTTPException(
             status_code=400,
             detail=(
