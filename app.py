@@ -44,7 +44,7 @@ OUTPUT_DPI = 300
 MAX_LONG_SIDE = 12000
 
 # 0 = invisible, 255 = completamente opaca
-WATERMARK_OPACITY = 100
+WATERMARK_OPACITY = 180
 
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
